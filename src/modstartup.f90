@@ -66,6 +66,7 @@ contains
     use moddatetime,       only : initdatetime
     use modemission,       only : initemission
     use modlsm,            only : initlsm, kmax_soil
+    use moddeposition,     only : initdrydep
     use modfields,         only : initfields
     use modpois,           only : initpois
     use modradiation,      only : initradiation
@@ -275,6 +276,7 @@ contains
     call initdatetime
     call initemission
     call initlsm
+    call initdrydep
     call initsubgrid
 
     call initmicrophysics
@@ -1235,6 +1237,7 @@ contains
     use modsubgrid,        only : exitsubgrid
     use modsurface,        only : exitsurface
     use modlsm,            only : exitlsm
+    use moddeposition,     only : exitdrydep
     use modthermodynamics, only : exitthermodynamics
     use modemission,       only : exitemission
 
@@ -1242,6 +1245,7 @@ contains
     call exitthermodynamics
     call exitsurface
     call exitlsm
+    call exitdrydep
     call exitsubgrid
     call exitradiation
     call exitpois
