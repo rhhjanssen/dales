@@ -18,15 +18,14 @@
 !
 
 module moddeposition
-    use modlsm,    only : tile, nlu
+    use modlsm,    only : tile, nlu, llsm
     use modfields, only : svp   ! tracer tendency array
     use modglobal, only : nsv, i1, j1
 
     implicit none
 
-    public  :: initdrydep, drydep, exitdrydep
+    public  :: initdrydep, drydep, exitdrydep, ldrydep
 
-    logical :: llsm            ! On/off switch LSM
     logical :: ldrydep         ! On/Off switch dry deposition 
     real, allocatable    :: depfield(:,:,:) ! deposition tendencies (i,j,sv)
     integer  :: svskip   =  0        ! no. scalars to exclude for deposition
@@ -39,7 +38,7 @@ subroutine drydep
   integer :: ilu
 
   if (.not. llsm .or. .not. ldrydep) return ! Dry deposition cannot be run if LSM not activated
-  
+
   !! for testing only
   do ilu=1, nlu
     write(*,*) 'luname ', trim(tile(ilu)%luname)
@@ -107,12 +106,6 @@ subroutine initdrydep
               depnames = (/ ('      ', iname=1, 100) /) ! list with scalar names,
                           ! each name must(!) be 6 characters long for now  
 
-  ! ---------------------------------------------------------------------!
-  ! Main variables                                                       !
-  ! ---------------------------------------------------------------------!
-
-  real, allocatable :: depfield(:,:,:) !array for deposition fields
-
   ! --- Read & broadcast namelist DEPOSITION -----------------------------------
   namelist/NAMDEPOSITION/ ldrydep, svskip, depnames 
 
@@ -126,7 +119,7 @@ subroutine initdrydep
 
   endif
 
-  call mpi_bcast(ldrydep,      1, mpi_logical,   0, comm3d, ierr)
+  call mpi_bcast(ldrydep,           1, mpi_logical,   0, comm3d, ierr)
   call mpi_bcast(svskip,            1, mpi_integer,   0, comm3d, ierr)
   call mpi_bcast(depnames(1:100), 100, mpi_character, 0, comm3d, ierr)
 

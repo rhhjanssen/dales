@@ -21,7 +21,7 @@ module modlsm
     use netcdf
     implicit none
 
-    public :: initlsm, lsm, exitlsm, init_lsm_tiles, lags
+    public :: initlsm, lsm, exitlsm, init_lsm_tiles, lags, llsm
 
     logical :: llsm            ! On/off switch LSM
     logical :: lfreedrainage   ! Free drainage bottom BC for soil moisture
@@ -1983,6 +1983,7 @@ subroutine init_heterogeneous_nc
       write(*,*) 'a_r           ', sum(tile(ilu)%a_r(2:i1,2:j1))/size(tile(ilu)%a_r(2:i1,2:j1)), minval(tile(ilu)%a_r(2:i1,2:j1)), maxval(tile(ilu)%a_r(2:i1,2:j1))
       write(*,*) 'b_r           ', sum(tile(ilu)%b_r(2:i1,2:j1))/size(tile(ilu)%b_r(2:i1,2:j1)), minval(tile(ilu)%b_r(2:i1,2:j1)), maxval(tile(ilu)%b_r(2:i1,2:j1))
       write(*,*) 'tskin         ', sum(tile(ilu)%tskin(2:i1,2:j1))/size(tile(ilu)%tskin(2:i1,2:j1)), minval(tile(ilu)%tskin(2:i1,2:j1)), maxval(tile(ilu)%tskin(2:i1,2:j1)) 
+      write(*,*) 'R_inc_b       ', sum(tile(ilu)%R_inc_b(2:i1,2:j1))/size(tile(ilu)%R_inc_b(2:i1,2:j1)), minval(tile(ilu)%R_inc_b(2:i1,2:j1)), maxval(tile(ilu)%R_inc_b(2:i1,2:j1)) 
       write(*,*) ''
     end do
 
