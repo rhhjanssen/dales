@@ -147,7 +147,7 @@ contains
         if (isurf == 1) then
             nvar3 = 12
         else if (isurf == 11) then
-            nvar3 = 16
+            nvar3 = 13
             if (lags) nvar3 = nvar3 + 2
         end if
 
@@ -192,7 +192,7 @@ contains
               call ncinfo(ncname3(14,:),'an_co2', 'Net CO2 assimilation', 'ppb m s-1', 'tt0t')
               call ncinfo(ncname3(15,:),'resp_co2', 'CO2 respiration soil', 'ppb m s-1', 'tt0t')
             end if
-
+            
             call open_nc(fname3, ncid3, nrec3, n1=imax, n2=jmax)
             if (nrec3==0) then
               call define_nc(ncid3, 1, tncname3)

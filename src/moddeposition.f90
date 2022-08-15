@@ -40,10 +40,12 @@ subroutine drydep
 
   if (.not. llsm .or. .not. ldrydep) return ! Dry deposition cannot be run if LSM not activated
   
+  !! for testing only
   do ilu=1, nlu
-    write(*,*) 'luname', trim(tile(ilu)%luname)
-    write(*,*) 'frac  ', sum(tile(ilu)%base_frac)/(max(1,size(tile(ilu)%base_frac)))
-    write(*,*) 'z0h   ', sum(tile(ilu)%z0h)/(max(1,size(tile(ilu)%z0h)))
+    write(*,*) 'luname ', trim(tile(ilu)%luname)
+    write(*,*) 'frac   ', sum(tile(ilu)%base_frac)/(max(1,size(tile(ilu)%base_frac)))
+    write(*,*) 'z0h    ', sum(tile(ilu)%z0h)/(max(1,size(tile(ilu)%z0h)))
+    write(*,*) 'R_inc_b', sum(tile(ilu)%R_inc_b)/(max(1,size(tile(ilu)%R_inc_b)))
   end do
 
   depfield = 0

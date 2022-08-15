@@ -70,9 +70,11 @@ module modlsm
     ! Fixed LU properties
         ! Land use name
         character(len=64) :: luname
-        character(len=2)  :: lushort
+        character(len=3)  :: lushort
         ! Check if LU type is vegetation 
         logical           :: lveg
+        ! Check if LU type is water
+        logical           :: laqu
         ! Static properties:
         real, allocatable :: z0m(:,:), z0h(:,:)
         ! Base tile fraction (i.e. without liquid water)
@@ -105,10 +107,33 @@ module modlsm
         real, allocatable :: root_frac(:,:,:)
         ! Root fraction weighted mean soil water content
         real, allocatable :: phiw_mean(:,:)
+
+    ! LU dependent deposition parameters 
+        ! In-canopy resistance parameters 
+        real, allocatable :: R_inc_b(:,:), R_inc_h(:,:)
+        ! SAI = SAI_a * LAI + SAI_b
+        real, allocatable :: SAI_a(:,:), SAI_b(:,:) 
+        ! Minimum correction factor for stomatal resistance
+        real, allocatable :: fmin(:,:)
+        ! Alpha value for light correction of stomatal resistance
+        real, allocatable :: alpha(:,:)
+        ! Min, optimum and max emperatures for temperature correction of stomatal resistance
+        real, allocatable :: Tmin(:,:), Topt(:,:), Tmax(:,:)
+        ! Maximum leaf stomatal conductance for ozone
+        real, allocatable :: gs_max(:,:) 
+        ! Minimum and maximum vapour pressure deficit parameters
+        real, allocatable :: vpd_min(:,:), vpd_max(:,:)
+        ! Gamma parameter for calculating stomata compensation point
+        real, allocatable :: gamma_stom(:,:)
+        ! Gamma correction factor for calculating soil compensation point
+        real, allocatable :: gamma_soil_c_fac(:,:)
+        ! Gamma parameter for calculating soil compensation point
+        real, allocatable :: gamma_soil_default(:,:)
+
     end type T_lsm_tile
 
     !Tiles for all LU types
-    integer :: ilu, nlu
+    integer :: ilu, nlu, ilu_ws
     type(T_lsm_tile), allocatable :: tile(:)
 
     ! Land-surface / van Genuchten parameters from NetCDF input table.
@@ -181,13 +206,13 @@ subroutine calc_tile_fractions
 
     integer :: i, j
     real :: c_liq
-    character(len=2) :: lushort
+    character(len=3) :: lushort
     real :: base_frac_sum
     real :: sum_frac, sum_basefrac
 
     ! Water tile fraction is not variable
     do ilu=1,nlu
-      if (trim(tile(ilu)%lushort) == 'aq') then
+      if (tile(ilu)%laqu) then
         tile(ilu)%frac(:,:) = tile(ilu)%base_frac(:,:)
       end if
     end do 
@@ -197,9 +222,9 @@ subroutine calc_tile_fractions
         c_liq = min(1., wl(i,j)/wl_max(i,j))
         base_frac_sum = 0
         do ilu=1,nlu
-          if (trim(tile(ilu)%lushort) == 'aq') then
+          if (tile(ilu)%laqu) then
             cycle 
-          else if (trim(tile(ilu)%lushort) == 'ws') then 
+          else if (ilu == ilu_ws) then 
             tile(ilu)%frac(i,j) = land_frac(i,j) * c_liq
           else
             tile(ilu)%frac(i,j) = (1.-c_liq) * tile(ilu)%base_frac(i,j)
@@ -259,12 +284,13 @@ subroutine calc_liquid_reservoir
             wl_tend_max = (wl_max(i,j) - wlm(i,j)) / rk3coef
 
             do ilu=1,nlu
-              if (trim(tile(ilu)%lushort) == 'aq') then
+              if (tile(ilu)%laqu) then
                 cycle
               end if
 
               ! Tendency due to evaporation from liquid water reservoir/tile.
-              if (trim(tile(ilu)%lushort) == 'ws') then
+              !if (trim(tile(ilu)%lushort) == 'ws') then
+              if (ilu == ilu_ws) then
                 wl_tend_liq = wl_tend_liq -max(0., tile(ilu)%frac(i,j) * tile(ilu)%LE(i,j) * to_ms)
               end if 
 
@@ -384,9 +410,9 @@ subroutine calc_canopy_resistance_js
             do ilu=1,nlu
               if (tile(ilu)%lveg) then
                 tile(ilu)%rs(i,j) = tile(ilu)%rs_min(i,j) / tile(ilu)%lai(i,j) * tile(ilu)%f2(i,j) * tile(ilu)%f3(i,j) * f1(i,j)
-              else if (trim(tile(ilu)%lushort) == 'bs') then
+              else if (trim(tile(ilu)%lushort) == 'bs' .or. trim(tile(ilu)%lushort) == 'brn') then !TODO; special function for bare soil
                 tile(ilu)%rs(i,j) = tile(ilu)%rs_min(i,j) / f2b(i,j)
-              else if (trim(tile(ilu)%lushort) == 'ws') then
+              else if (ilu == ilu_ws) then
                 tile(ilu)%rs(i,j) = 0
               else
                 tile(ilu)%rs(i,j) = tile(ilu)%rs_min(i,j)
@@ -571,7 +597,6 @@ subroutine calc_water_bcs(tile)
 
     do j=2, j1
       do i=2, i1
-        !if (tile_aq%frac(i,j) > 0) then
         if (tile%frac(i,j) > 0) then
             !! Calculate BCs. `tile_aq%tskin` is fixed in time (for now...)
             !tile_aq%thlskin(i,j) = tile_aq%tskin(i,j) / exnh(1)
@@ -611,7 +636,7 @@ end subroutine calc_water_bcs
 ! the diffusion scheme, thermodynamics, ...
 !
 subroutine calc_bulk_bcs
-    use modglobal,   only : i1, j1, cp, rlv, fkar, zf, cu, cv, grav, rv, rd
+    use modglobal,   only : i1, j1, cp, rlv, fkar, zf, cu, cv, grav, rv, rd, eps1
     use modfields,   only : rhof, thl0, qt0, u0, v0, thvh
     use modsurface,  only : phim, phih
     use modmpi,      only : excjs
@@ -629,7 +654,7 @@ subroutine calc_bulk_bcs
     ! Calculate surface temperature for each tile, and calculate
     ! surface fluxes (H, LE, G0, wthl, wqt) and values (thlskin, qtskin)
     do ilu=1,nlu
-      if (trim(tile(ilu)%lushort) == 'aq') then 
+      if (tile(ilu)%laqu) then
         call calc_water_bcs(tile(ilu))
       else
         call calc_tile_bcs(tile(ilu))
@@ -645,6 +670,7 @@ subroutine calc_bulk_bcs
             tskin(i,j) = 0 
             qskin(i,j) = 0 
             rsveg(i,j) = 0
+            rssoil(i,j) = 0
             do ilu=1,nlu
               H(i,j)      = H(i,j)     + tile(ilu)%frac(i,j) * tile(ilu)%H(i,j) 
               LE(i,j)     = LE(i,j)    + tile(ilu)%frac(i,j) * tile(ilu)%LE(i,j) 
@@ -658,9 +684,10 @@ subroutine calc_bulk_bcs
             thlflux(i,j) =  H(i,j)  * rhocp_i
             qtflux (i,j) =  LE(i,j) * rholv_i
 
-            ! Calculate mean Obukhov length from mean fluxes
+            ! Calculate mean Obukhov length from mean fluxes 
             bflux = grav/thvh(1) * (thlflux(i,j) * (1.-(1.-rv/rd)*qskin(i,j)) - &
                 (1.-rv/rd)*tskin(i,j)*qtflux(i,j))
+            obl(i,j) = -ustar(i,j)**3 / (fkar * bflux)
 
             ! MO gradients
             dthldz(i,j) = -thlflux(i,j) / (fkar * zf(1) * ustar(i,j)) * phih(zf(1)/obl(i,j))
@@ -678,7 +705,8 @@ subroutine calc_bulk_bcs
 
             ! Just for diagnostics (modlsmcrosssection)
             do ilu=1,nlu
-              if (trim(tile(ilu)%lushort) == 'ws') then
+              !if (trim(tile(ilu)%lushort) == 'ws') then
+              if (ilu == ilu_ws) then
                 cliq(i,j) = tile(ilu)%frac(i,j) / land_frac(i,j)
               endif
             enddo
@@ -690,21 +718,26 @@ subroutine calc_bulk_bcs
                 do ilu=1,nlu
                   if (tile(ilu)%lveg) then
                     rsveg(i,j) = rsveg(i,j) + tile(ilu)%frac(i,j) * tile(ilu)%rs(i,j) 
+                    ! if ( tile(ilu)%frac(i,j) <= 0.0 ) then 
+                    !   cycle
+                    ! endif
+                    ! rsveg(i,j) = 1/(rsveg(i,j)**(-1) + (tile(ilu)%rs(i,j) * tile(ilu)%frac(i,j))**(-1)) 
                   endif
                 enddo
                 rsveg(i,j) = rsveg(i,j) / cveg(i,j)
             else
-                rsveg(i,j) = 0.
+                rsveg(i,j) = 0. 
             end if
-
             do ilu=1,nlu
-              if ( (trim(tile(ilu)%lushort) == 'bs' .or. trim(tile(ilu)%lushort) == 'ap' .or. trim(tile(ilu)%lushort) == 'bu') .and. tile(ilu)%frac(i,j) > 0) then 
+            ! TODO: flexible solution for LU types with soil resistance
+              if ( .not. (tile(ilu)%lveg .or. tile(ilu)%laqu .or. (ilu == ilu_ws) ) ) then
                   rssoil(i,j) = rssoil(i,j) + tile(ilu)%rs(i,j) * tile(ilu)%frac(i,j)
-              else
-                  rssoil(i,j) = 0.
+                  ! if ( tile(ilu)%frac(i,j) <= 0.0 ) then 
+                  !   cycle
+                  ! endif
+                  ! rssoil(i,j) = 1/(rssoil(i,j)**(-1) + (tile(ilu)%rs(i,j) * tile(ilu)%frac(i,j))**(-1))
               end if
             end do
-
         end do
     end do
 
@@ -1107,7 +1140,6 @@ subroutine exitlsm
     deallocate( soil_index, tsoil, tsoilm, phiw, phiwm, phiw_source )
     deallocate( wl, wlm, wl_max )
     deallocate( throughfall, interception )
-    !deallocate( gD, f1, f2_lv, f2_hv, f2b, f3 )
     deallocate( f1, f2b )
     deallocate( du_tot, thv_1, land_frac, cveg )
     deallocate( lambda, lambdah, lambdas, lambdash, gammas, gammash )
@@ -1270,6 +1302,8 @@ subroutine allocate_fields
       call allocate_tile(tile(ilu))
     enddo
 
+    ilu_ws = nlu
+
 end subroutine allocate_fields
 
 !
@@ -1330,6 +1364,32 @@ subroutine allocate_tile(tile)
     allocate(tile % f3(i2, j2))
     allocate(tile % gD(i2, j2))
 
+    ! In-canopy resistance parameters 
+    allocate(tile % R_inc_b(i2, j2)) 
+    allocate(tile % R_inc_h(i2, j2))
+    ! SAI = SAI_a * LAI + SAI_b
+    allocate(tile % SAI_a(i2, j2)) 
+    allocate(tile % SAI_b(i2, j2)) 
+    ! Minimum correction factor for stomatal resistance
+    allocate(tile % fmin(i2, j2))
+    ! Alpha value for light correction of stomatal resistance
+    allocate(tile % alpha(i2, j2))
+    ! Min, optimum and max emperatures for temperature correction of stomatal resistance
+    allocate(tile % Tmin(i2, j2)) 
+    allocate(tile % Topt(i2, j2)) 
+    allocate(tile % Tmax(i2, j2))
+    ! Maximum leaf stomatal conductance for ozone
+    allocate(tile % gs_max(i2, j2)) 
+    ! Minimum and maximum vapour pressure deficit parameters
+    allocate(tile % vpd_min(i2, j2))
+    allocate(tile % vpd_max(i2, j2))
+    ! Gamma parameter for calculating stomata compensation point
+    allocate(tile % gamma_stom(i2, j2))
+    ! Gamma correction factor for calculating soil compensation point
+    allocate(tile % gamma_soil_c_fac(i2, j2))
+    ! Gamma parameter for calculating soil compensation point
+    allocate(tile % gamma_soil_default(i2, j2))
+
 end subroutine allocate_tile
 
 !
@@ -1346,6 +1406,13 @@ subroutine deallocate_tile(tile)
     deallocate( tile%db, tile%lai, tile%rs_min, tile%rs )
     deallocate( tile%a_r, tile%b_r, tile%root_frac, tile%phiw_mean )
     deallocate( tile%f2, tile%f3, tile%gD )
+    deallocate( tile%R_inc_b, tile%R_inc_h)
+    deallocate( tile%SAI_a, tile%SAI_b) 
+    deallocate( tile%fmin, tile%alpha)
+    deallocate( tile%Tmin, tile%Topt, tile%Tmax,)
+    deallocate( tile%gs_max, tile%vpd_min, tile%vpd_max)
+    deallocate( tile%gamma_stom, tile%gamma_soil_c_fac, tile%gamma_soil_default)
+
 end subroutine deallocate_tile
 
 !
@@ -1495,6 +1562,13 @@ subroutine init_homogeneous
     tile(ilu_ap)%lveg = .False.
     tile(ilu_ws)%lveg = .False.
 
+    tile(ilu_lv)%laqu = .False. 
+    tile(ilu_hv)%laqu = .False.
+    tile(ilu_bs)%laqu = .False.
+    tile(ilu_aq)%laqu = .True.
+    tile(ilu_ap)%laqu = .False.
+    tile(ilu_ws)%laqu = .False.
+
     ! Set values
     tile(ilu_lv) % base_frac(:,:) = c_low
     tile(ilu_hv) % base_frac(:,:) = c_high
@@ -1592,162 +1666,6 @@ subroutine init_homogeneous
 end subroutine init_homogeneous
 
 !
-! Init LSM properties from external input
-!
-subroutine init_heterogeneous
-    use modglobal,   only : i1, j1, lwarmstart, iexpnr, eps1
-    use modglobal,   only : i2, j2
-    use modmpi,      only : myidx, myidy
-    use modsurfdata, only : tsoil, phiw, wl, wlm, wmax
-    implicit none
-
-    integer       :: ilu_lv, ilu_hv, ilu_aq, ilu_ap, ilu_ws, ilu_bs
-    real          :: lai_tmp(i2,j2)
-    character(20) :: input_file = 'lsm.inp.x___y___.___'
-    write(input_file(10:12), '(i3.3)') myidx
-    write(input_file(14:16), '(i3.3)') myidy
-    write(input_file(18:20), '(i3.3)') iexpnr
-
-    open(666, file=input_file, form='unformatted', status='unknown', action='read', access='stream')
-
-    ! hack to manually enter data that is not in file
-    tile(1)%lushort = 'lv'
-    tile(2)%lushort = 'hv'
-    tile(3)%lushort = 'bs'
-    tile(4)%lushort = 'aq'
-    tile(5)%lushort = 'ap'
-    tile(6)%lushort = 'ws'
-
-    tile(1)%luname = 'low vegetation'
-    tile(2)%luname = 'high vegetation'
-    tile(3)%luname = 'bare soil'
-    tile(4)%luname = 'water'
-    tile(5)%luname = 'asphalt'
-    tile(6)%luname = 'water on leaf'
-
-    tile(1)%lveg = .true.
-    tile(2)%lveg = .true.
-    tile(3)%lveg = .false.
-    tile(4)%lveg = .false.
-    tile(5)%lveg = .false.
-    tile(6)%lveg = .false.
-
-    ilu_lv = 1
-    ilu_hv = 2
-    ilu_bs = 3
-    ilu_aq = 4
-    ilu_ap = 5
-    ilu_ws = 6
-
-    !todo: check order of variables in input file, modify file if needed
-
-    ! 2D surface fields
-    do ilu=1,nlu-1
-      read(666) tile(ilu)%base_frac(2:i1, 2:j1)
-    enddo
-    do ilu=1,nlu-1
-      read(666) tile(ilu)%z0m(2:i1, 2:j1)
-    enddo
-    do ilu=1,nlu-1
-      read(666) tile(ilu)%z0h(2:i1, 2:j1)
-    enddo
-    do ilu=1,nlu-1
-      if (ilu == ilu_aq) cycle
-      read(666) tile(ilu)%lambda_stable(2:i1, 2:j1)
-    enddo
-    do ilu=1,nlu-1
-      if (ilu == ilu_aq) cycle
-      read(666) tile(ilu)%lambda_unstable(2:i1, 2:j1)
-    enddo
-    do ilu=1,nlu
-      if (ilu > ilu_hv) cycle      
-      read(666) tile(ilu)%lai(2:i1, 2:j1)
-    enddo
-    do ilu=1,nlu-1
-      if (ilu == ilu_aq) cycle
-      read(666) tile(ilu)%rs_min(2:i1, 2:j1)
-    enddo
-    read(666) tile(ilu_lv)%a_r(2:i1, 2:j1)
-    read(666) tile(ilu_lv)%b_r(2:i1, 2:j1)
-    read(666) tile(ilu_hv)%a_r(2:i1, 2:j1)
-    read(666) tile(ilu_hv)%b_r(2:i1, 2:j1)
-
-    do ilu=1,nlu
-      if (ilu == ilu_hv) then       
-        read(666) tile(ilu)%gD(2:i1, 2:j1)
-      else
-        tile(ilu)%gD(2:i1, 2:j1) = 0
-      end if
-    end do
-
-    read(666) tile(ilu_aq)%tskin(2:i1, 2:j1)
-
-    ! 3D soil fields
-    read(666) soil_index(2:i1, 2:j1, 1:kmax_soil)
-  !write(*,*) 'soil_ind', kmax_soil, soil_index(3,3,1)
-  !write(*,*) 'soil_ind_minmax', minval(soil_index), maxval(soil_index)
-  !write(*,*) 'gDmean  ', minval(gD), maxval(gD), sum(gD)/(max(1,size(gD)))
-  !write(*,*) 'lvfracmean', sum(tile_lv%base_frac)/(max(1,size(tile_lv%base_frac)))
-  !write(*,*) 'hvfracmean', sum(tile_hv%base_frac)/(max(1,size(tile_hv%base_frac)))
-  !write(*,*) 'aqfracmean', sum(tile_aq%base_frac)/(max(1,size(tile_aq%base_frac)))
-  !write(*,*) 'apfracmean', sum(tile_ap%base_frac)/(max(1,size(tile_ap%base_frac)))
-  !write(*,*) 'bsfracmean', sum(tile_bs%base_frac)/(max(1,size(tile_bs%base_frac)))
-    if (.not. lwarmstart) then
-        read(666) tsoil(2:i1, 2:j1, 1:kmax_soil)
-        read(666) phiw (2:i1, 2:j1, 1:kmax_soil)
-
-        wl(:,:)  = 0.
-        wlm(:,:) = 0.
-    end if
-
-    close(666)
-
-    ! Derived quantities
-    tile(ilu_ws)%base_frac(:,:) = 0.
-    tile(ilu_ws)%z0m(:,:) = 0
-    tile(ilu_ws)%z0h(:,:) = 0
-    tile(ilu_ws)%lambda_stable(:,:) = 0
-    tile(ilu_ws)%lambda_unstable(:,:) = 0
-
-    do ilu=1,nlu
-      if (trim(tile(ilu)%lushort) == 'aq') then
-        cycle
-      else
-        tile(ilu_ws)%z0m(:,:) = tile(ilu_ws)%z0m(:,:) + tile(ilu)%base_frac(:,:)*tile(ilu)%z0m(:,:)
-        tile(ilu_ws)%z0h(:,:) = tile(ilu_ws)%z0h(:,:) + tile(ilu)%base_frac(:,:)*tile(ilu)%z0h(:,:)
-        tile(ilu_ws)%lambda_stable(:,:) = tile(ilu_ws)%lambda_stable(:,:) + tile(ilu)%base_frac(:,:)*tile(ilu)%lambda_stable(:,:)
-        tile(ilu_ws)%lambda_unstable(:,:) = tile(ilu_ws)%lambda_unstable(:,:) + tile(ilu)%base_frac(:,:)*tile(ilu)%lambda_unstable(:,:)
-      end if
-    end do
-
-    ! Calculate vegetation fraction, and limit to prevent div/0's
-    do ilu=1,nlu
-      if (tile(ilu)%lveg) then
-        cveg(:,:) = cveg(:,:) + tile(ilu)%base_frac(:,:)
-      end if
-    end do
-    where (cveg == 0) cveg = eps1
-
-    ! Calculate land fraction, and limit to prevent div/0's
-    land_frac(:,:) = 1.-tile(ilu_aq)%base_frac(:,:)
-    where (land_frac == 0) land_frac = eps1
-
-    ! Max liquid water per grid point, accounting for LAI
-    wl_max = 0
-    do ilu=1,nlu
-      if (tile(ilu)%lveg) then
-        lai_tmp(:,:) = tile(ilu)%lai(:,:)
-      else
-        lai_tmp(:,:) = 1
-      endif
-      wl_max(:,:) = wl_max(:,:) + tile(ilu)%base_frac(:,:) * lai_tmp(:,:)
-    enddo
-    wl_max(:,:) = wl_max(:,:) * wmax/land_frac(:,:) 
-    where (wl_max == 0) wl_max = eps1
-
-end subroutine init_heterogeneous
-
-!
 ! Init LSM properties from external input: read from NetCDF
 !
 subroutine init_heterogeneous_nc
@@ -1761,11 +1679,13 @@ subroutine init_heterogeneous_nc
     use modsurfdata, only : tsoil, phiw, wl, wlm, wmax
     implicit none
 
-    integer       :: ilu_lv, ilu_hv, ilu_aq, ilu_ap, ilu_ws, ilu_bs
+    !integer       :: ilu_lv, ilu_hv, ilu_aq, ilu_ap, ilu_ws, ilu_bs
+    integer       :: ilu_ws
     real          :: lai_tmp(i2,j2)
     character(32) :: input_file = 'lsm.inp_xxx.nc' 
     integer       :: ncid , varid
     character     :: lvegs(nlu-1)
+    character     :: laqus(nlu-1)
     integer       :: nlu_file
     
     write(input_file(9:11), '(i3.3)') iexpnr
@@ -1778,7 +1698,7 @@ subroutine init_heterogeneous_nc
     
     ! check if nlu_file==nlu-1 ('wet skin' is not in file)
     if (nlu-1 /= nlu_file) then
-      write(6,"(A46, i3, A2, i3)") "STOPPED. Number of LU types in file differs from nlu-1:  ", nlu-1, " /=", nlu_file
+      write(6,"(A58, i3, A3, i3)") "STOPPED. Number of LU types in file differs from nlu-1:  ", nlu-1, " /=", nlu_file
       stop
     end if
 
@@ -1792,7 +1712,7 @@ subroutine init_heterogeneous_nc
       call check( nf90_inq_varid( ncid, 'lushort', varid) )
       call check( nf90_get_var(ncid, varid, tile(ilu)%lushort , &
                               start = (/ 1, ilu /) , &
-                              count = (/ 2, 1   /)) )
+                              count = (/ 3, 1   /)) )
 
       call check( nf90_inq_varid( ncid, 'lveg', varid) )
       call check( nf90_get_var(ncid, varid, lvegs(ilu), &
@@ -1806,72 +1726,62 @@ subroutine init_heterogeneous_nc
         print *,'logical lveg not defined'
         stop
       end if
-      
-      ! todo: read from file
-      if (tile(ilu)%lushort == 'lv') then
-        ilu_lv = ilu
-      else if (tile(ilu)%lushort == 'hv') then
-        ilu_hv = ilu
-      else if (tile(ilu)%lushort == 'bs') then
-        ilu_bs = ilu
-      else if (tile(ilu)%lushort == 'aq') then
-        ilu_aq = ilu
-      else if (tile(ilu)%lushort == 'ap') then
-        ilu_ap = ilu
+
+      call check( nf90_inq_varid( ncid, 'laqu', varid) )
+      call check( nf90_get_var(ncid, varid, laqus(ilu), &
+                                start = (/ 1, ilu /), &
+                                count = (/ 1, 1   /) ) )
+      if (trim(laqus(ilu)) .eq. "T") then
+        tile(ilu)%laqu = .true.
+      else if (trim(laqus(ilu)) .eq. "F") then
+        tile(ilu)%laqu = .false.
+      else 
+        print *,'logical laqu not defined'
+        stop
       end if
+
     end do
     
     ! wet skin is always the last LU type; set explicitly
     ilu_ws            = nlu
     tile(nlu)%luname  = 'wet skin'    
-    tile(nlu)%lushort = 'ws'    
+    tile(nlu)%lushort = 'ws '
     tile(nlu)%lveg    = .false.    
-    
+    tile(nlu)%laqu    = .false.    
+
     ! 2D surface fields
     do ilu=1,nlu-1
+      write(*,*) 'reading variables for LU type: ', trim(tile(ilu)%lushort)
       ! LU cover
-      call check( nf90_inq_varid( ncid, 'c_'//trim(tile(ilu)%lushort), varid) )
+      call check( nf90_inq_varid( ncid, 'cover_'//trim(tile(ilu)%lushort), varid) )
       call check( nf90_get_var(ncid, varid, tile(ilu)%base_frac(2:i1, 2:j1) , &
                                 start = (/1 + myidx * imax, 1 + myidy * jmax/), &
                                 count = (/imax, jmax/) ) )
-
       ! z0m 
       call check( nf90_inq_varid( ncid, 'z0m_'//trim(tile(ilu)%lushort), varid) )
       call check( nf90_get_var(ncid, varid, tile(ilu)%z0m(2:i1, 2:j1) , &
                                 start = (/1 + myidx * imax, 1 + myidy * jmax/), &
                                 count = (/imax, jmax/) ) )
-
       ! z0h 
       call check( nf90_inq_varid( ncid, 'z0h_'//trim(tile(ilu)%lushort), varid) )
       call check( nf90_get_var(ncid, varid, tile(ilu)%z0h(2:i1, 2:j1) , &
                                 start = (/1 + myidx * imax, 1 + myidy * jmax/), &
                                 count = (/imax, jmax/) ) )
-    enddo
-
-    do ilu=1,nlu-1
-      if (ilu == ilu_aq) cycle
       ! lambda stable
       call check( nf90_inq_varid( ncid, 'lambda_s_'//trim(tile(ilu)%lushort), varid) )
       call check( nf90_get_var(ncid, varid, tile(ilu)%lambda_stable(2:i1, 2:j1) , &
                                 start = (/1 + myidx * imax, 1 + myidy * jmax/), &
                                 count = (/imax, jmax/) ) )
-
       ! lambda unstable
       call check( nf90_inq_varid( ncid, 'lambda_us_'//trim(tile(ilu)%lushort), varid) )
       call check( nf90_get_var(ncid, varid, tile(ilu)%lambda_unstable(2:i1, 2:j1) , &
                                 start = (/1 + myidx * imax, 1 + myidy * jmax/), &
                                 count = (/imax, jmax/) ) )
-
       ! rs_min
       call check( nf90_inq_varid( ncid, 'rs_min_'//trim(tile(ilu)%lushort), varid) )
       call check( nf90_get_var(ncid, varid, tile(ilu)%rs_min(2:i1, 2:j1) , &
                                 start = (/1 + myidx * imax, 1 + myidy * jmax/), &
                                 count = (/imax, jmax/) ) )                          
-    enddo
-
-    do ilu=1,nlu
-      if (ilu /= ilu_hv .and. ilu /= ilu_lv) cycle    
-
       ! lai
       call check( nf90_inq_varid( ncid, 'lai_'//trim(tile(ilu)%lushort), varid) )
       call check( nf90_get_var(ncid, varid, tile(ilu)%lai(2:i1, 2:j1) , &
@@ -1887,25 +1797,95 @@ subroutine init_heterogeneous_nc
       call check( nf90_get_var(ncid, varid, tile(ilu)%b_r(2:i1, 2:j1) , &
                                 start = (/1 + myidx * imax, 1 + myidy * jmax/), &
                                 count = (/imax, jmax/) ) )
-    enddo
-
-    do ilu=1,nlu
-      if (ilu == ilu_hv) then       
-        ! gD
-        call check( nf90_inq_varid( ncid, 'gD', varid) )
-        call check( nf90_get_var(ncid, varid, tile(ilu)%gD(2:i1, 2:j1) , &
-                                  start = (/1 + myidx * imax, 1 + myidy * jmax/), &
-                                  count = (/imax, jmax/) ) )
-      else
-        tile(ilu)%gD(2:i1, 2:j1) = 0
-      end if
-    end do
-
+      ! gD
+      call check( nf90_inq_varid( ncid, 'gD_'//trim(tile(ilu)%lushort), varid) )
+      call check( nf90_get_var(ncid, varid, tile(ilu)%gD(2:i1, 2:j1) , &
+                                start = (/1 + myidx * imax, 1 + myidy * jmax/), &
+                                count = (/imax, jmax/) ) )
     ! tskin
-    call check( nf90_inq_varid( ncid, 'tskin_aq', varid) )
-    call check( nf90_get_var(ncid, varid, tile(ilu_aq)%tskin(2:i1, 2:j1) , &
+      call check( nf90_inq_varid( ncid, 'tskin_'//trim(tile(ilu)%lushort), varid) )
+      call check( nf90_get_var(ncid, varid, tile(ilu)%tskin(2:i1, 2:j1) , &
                               start = (/1 + myidx * imax, 1 + myidy * jmax/), &
                               count = (/imax, jmax/) ) )
+
+    !!! deposition parameters
+    !!! TODO: read only if ldep=True
+      ! R_inc_b 
+      call check( nf90_inq_varid( ncid, 'R_inc_b_'//trim(tile(ilu)%lushort), varid) )
+      call check( nf90_get_var(ncid, varid, tile(ilu)%R_inc_b(2:i1, 2:j1) , &
+                                start = (/1 + myidx * imax, 1 + myidy * jmax/), &
+                                count = (/imax, jmax/) ) )
+      ! R_inc_h 
+      call check( nf90_inq_varid( ncid, 'R_inc_h_'//trim(tile(ilu)%lushort), varid) )
+      call check( nf90_get_var(ncid, varid, tile(ilu)%R_inc_h(2:i1, 2:j1) , &
+                                start = (/1 + myidx * imax, 1 + myidy * jmax/), &
+                                count = (/imax, jmax/) ) )   
+      ! SAI_a 
+      call check( nf90_inq_varid( ncid, 'SAI_a_'//trim(tile(ilu)%lushort), varid) )
+      call check( nf90_get_var(ncid, varid, tile(ilu)%SAI_a(2:i1, 2:j1) , &
+                                start = (/1 + myidx * imax, 1 + myidy * jmax/), &
+                                count = (/imax, jmax/) ) )      
+      ! SAI_b 
+      call check( nf90_inq_varid( ncid, 'SAI_b_'//trim(tile(ilu)%lushort), varid) )
+      call check( nf90_get_var(ncid, varid, tile(ilu)%SAI_b(2:i1, 2:j1) , &
+                                start = (/1 + myidx * imax, 1 + myidy * jmax/), &
+                                count = (/imax, jmax/) ) )                             
+      ! fmin 
+      call check( nf90_inq_varid( ncid, 'fmin_'//trim(tile(ilu)%lushort), varid) )
+      call check( nf90_get_var(ncid, varid, tile(ilu)%fmin(2:i1, 2:j1) , &
+                                start = (/1 + myidx * imax, 1 + myidy * jmax/), &
+                                count = (/imax, jmax/) ) ) 
+      ! alpha 
+      call check( nf90_inq_varid( ncid, 'alpha_'//trim(tile(ilu)%lushort), varid) )
+      call check( nf90_get_var(ncid, varid, tile(ilu)%alpha(2:i1, 2:j1) , &
+                                start = (/1 + myidx * imax, 1 + myidy * jmax/), &
+                                count = (/imax, jmax/) ) )                             
+      ! Tmin 
+      call check( nf90_inq_varid( ncid, 'Tmin_'//trim(tile(ilu)%lushort), varid) )
+      call check( nf90_get_var(ncid, varid, tile(ilu)%Tmin(2:i1, 2:j1) , &
+                                start = (/1 + myidx * imax, 1 + myidy * jmax/), &
+                                count = (/imax, jmax/) ) )  
+      ! Topt 
+      call check( nf90_inq_varid( ncid, 'Topt_'//trim(tile(ilu)%lushort), varid) )
+      call check( nf90_get_var(ncid, varid, tile(ilu)%Topt(2:i1, 2:j1) , &
+                                start = (/1 + myidx * imax, 1 + myidy * jmax/), &
+                                count = (/imax, jmax/) ) )
+      ! Tmax 
+      call check( nf90_inq_varid( ncid, 'Tmax_'//trim(tile(ilu)%lushort), varid) )
+      call check( nf90_get_var(ncid, varid, tile(ilu)%Tmax(2:i1, 2:j1) , &
+                                start = (/1 + myidx * imax, 1 + myidy * jmax/), &
+                                count = (/imax, jmax/) ) )      
+     ! gs_max 
+      call check( nf90_inq_varid( ncid, 'gs_max_'//trim(tile(ilu)%lushort), varid) )
+      call check( nf90_get_var(ncid, varid, tile(ilu)%gs_max(2:i1, 2:j1) , &
+                                start = (/1 + myidx * imax, 1 + myidy * jmax/), &
+                                count = (/imax, jmax/) ) )   
+     ! vpd_min 
+      call check( nf90_inq_varid( ncid, 'vpd_min_'//trim(tile(ilu)%lushort), varid) )
+      call check( nf90_get_var(ncid, varid, tile(ilu)%vpd_min(2:i1, 2:j1) , &
+                                start = (/1 + myidx * imax, 1 + myidy * jmax/), &
+                                count = (/imax, jmax/) ) )    
+     ! vpd_max 
+      call check( nf90_inq_varid( ncid, 'vpd_max_'//trim(tile(ilu)%lushort), varid) )
+      call check( nf90_get_var(ncid, varid, tile(ilu)%vpd_max(2:i1, 2:j1) , &
+                                start = (/1 + myidx * imax, 1 + myidy * jmax/), &
+                                count = (/imax, jmax/) ) ) 
+     ! gamma_stom 
+      call check( nf90_inq_varid( ncid, 'gamma_stom_'//trim(tile(ilu)%lushort), varid) )
+      call check( nf90_get_var(ncid, varid, tile(ilu)%gamma_stom(2:i1, 2:j1) , &
+                                start = (/1 + myidx * imax, 1 + myidy * jmax/), &
+                                count = (/imax, jmax/) ) )  
+     ! gamma_soil_c_fac 
+      call check( nf90_inq_varid( ncid, 'gamma_soil_c_fac_'//trim(tile(ilu)%lushort), varid) )
+      call check( nf90_get_var(ncid, varid, tile(ilu)%gamma_soil_c_fac(2:i1, 2:j1) , &
+                                start = (/1 + myidx * imax, 1 + myidy * jmax/), &
+                                count = (/imax, jmax/) ) ) 
+     ! gamma_soil_default 
+      call check( nf90_inq_varid( ncid, 'gamma_soil_default_'//trim(tile(ilu)%lushort), varid) )
+      call check( nf90_get_var(ncid, varid, tile(ilu)%gamma_soil_default(2:i1, 2:j1) , &
+                                start = (/1 + myidx * imax, 1 + myidy * jmax/), &
+                                count = (/imax, jmax/) ) )                                                                                                                                                                                                                           
+    end do
 
     ! 3D soil fields
     ! soil index
@@ -1944,7 +1924,7 @@ subroutine init_heterogeneous_nc
     tile(ilu_ws)%lambda_unstable(:,:) = 0
 
     do ilu=1,nlu
-      if (ilu == ilu_aq) then
+      if (tile(ilu)%laqu) then
         cycle
       else
         tile(ilu_ws)%z0m(:,:) = tile(ilu_ws)%z0m(:,:) + tile(ilu)%base_frac(:,:)*tile(ilu)%z0m(:,:)
@@ -1963,13 +1943,19 @@ subroutine init_heterogeneous_nc
     where (cveg == 0) cveg = eps1
 
     ! Calculate land fraction, and limit to prevent div/0's
-    land_frac(:,:) = 1.-tile(ilu_aq)%base_frac(:,:)
+    do ilu=1,nlu
+      if (tile(ilu)%laqu) then
+        land_frac(:,:) = 1.-tile(ilu)%base_frac(:,:)
+      end if    
+    end do
     where (land_frac == 0) land_frac = eps1
 
     ! Max liquid water per grid point, accounting for LAI
     wl_max = 0
     do ilu=1,nlu
-      if (ilu == ilu_aq) cycle
+      if (tile(ilu)%laqu) then 
+        cycle
+      endif
       if (tile(ilu)%lveg) then
         lai_tmp(:,:) = tile(ilu)%lai(:,:)
         wl_max(:,:)  = wl_max(:,:) + tile(ilu)%base_frac(:,:) * lai_tmp(:,:)
@@ -1990,22 +1976,16 @@ subroutine init_heterogeneous_nc
       write(*,*) 'rs_min        ', sum(tile(ilu)%rs_min(2:i1,2:j1))/size(tile(ilu)%rs_min(2:i1,2:j1)), minval(tile(ilu)%rs_min(2:i1,2:j1)), maxval(tile(ilu)%rs_min(2:i1,2:j1)) 
       write(*,*) 'gD            ', sum(tile(ilu)%gD(2:i1,2:j1))/size(tile(ilu)%gD(2:i1,2:j1)), minval(tile(ilu)%gD(2:i1,2:j1)), maxval(tile(ilu)%gD(2:i1,2:j1)) 
 
-      if (ilu == ilu_aq) cycle
       write(*,*) 'lambda_stable ', sum(tile(ilu)%lambda_stable(2:i1,2:j1))/size(tile(ilu)%lambda_stable(2:i1,2:j1)), minval(tile(ilu)%lambda_stable(2:i1,2:j1)), maxval(tile(ilu)%lambda_stable(2:i1,2:j1)) 
       write(*,*) 'lambda_unstab ', sum(tile(ilu)%lambda_unstable(2:i1,2:j1))/size(tile(ilu)%lambda_unstable(2:i1,2:j1)), minval(tile(ilu)%lambda_unstable(2:i1,2:j1)), maxval(tile(ilu)%lambda_unstable(2:i1,2:j1)) 
-      write(*,*) ''
-    end do
 
-    do ilu=1,nlu
-      if (ilu /= ilu_hv .and. ilu /= ilu_lv) cycle   
-      write(*,*) 'lushort       ', tile(ilu)%lushort 
       write(*,*) 'lai           ', sum(tile(ilu)%lai(2:i1,2:j1))/size(tile(ilu)%lai(2:i1,2:j1)), minval(tile(ilu)%lai(2:i1,2:j1)), maxval(tile(ilu)%lai(2:i1,2:j1))
       write(*,*) 'a_r           ', sum(tile(ilu)%a_r(2:i1,2:j1))/size(tile(ilu)%a_r(2:i1,2:j1)), minval(tile(ilu)%a_r(2:i1,2:j1)), maxval(tile(ilu)%a_r(2:i1,2:j1))
       write(*,*) 'b_r           ', sum(tile(ilu)%b_r(2:i1,2:j1))/size(tile(ilu)%b_r(2:i1,2:j1)), minval(tile(ilu)%b_r(2:i1,2:j1)), maxval(tile(ilu)%b_r(2:i1,2:j1))
+      write(*,*) 'tskin         ', sum(tile(ilu)%tskin(2:i1,2:j1))/size(tile(ilu)%tskin(2:i1,2:j1)), minval(tile(ilu)%tskin(2:i1,2:j1)), maxval(tile(ilu)%tskin(2:i1,2:j1)) 
       write(*,*) ''
     end do
 
-    write(*,*) 'tskin_aq      ', sum(tile(ilu_aq)%tskin(2:i1,2:j1))/size(tile(ilu_aq)%tskin(2:i1,2:j1)), minval(tile(ilu_aq)%tskin(2:i1,2:j1)), maxval(tile(ilu_aq)%tskin(2:i1,2:j1)) 
     write(*,*) 'soil_index top', sum(soil_index(2:i1,2:j1,4))/size(soil_index(2:i1,2:j1,4)), minval(soil_index(2:i1,2:j1,4)), maxval(soil_index(2:i1,2:j1,4)) 
 
     write(*,*) 'tsoil top     ', sum(tsoil(2:i1,2:j1,4))/size(tsoil(2:i1,2:j1,4)), minval(tsoil(2:i1,2:j1,4)), maxval(tsoil(2:i1,2:j1,4)) 
@@ -2014,6 +1994,7 @@ subroutine init_heterogeneous_nc
     write(*,*) 'land_frac', sum(land_frac)/size(land_frac), minval(land_frac), maxval(land_frac) 
     write(*,*) 'wl_max   ', sum(wl_max)/size(wl_max), minval(wl_max), maxval(wl_max) 
     write(*,*) 'wmax     ', wmax 
+    !call flush()
 
 end subroutine init_heterogeneous_nc
 
